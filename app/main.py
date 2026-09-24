@@ -20,6 +20,9 @@ from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .duplicates import find_duplicates
 from .schemas import (
+    CreditMemoCreate,
+    CreditMemoOverview,
+    CreditMemoResult,
     Health,
     InstallmentPlanCreate,
     InstallmentPlanResult,
@@ -52,7 +55,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -61,6 +64,8 @@ app = FastAPI(
         "到期日（due_date）与逾期发票分页查询、"
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
         "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
+        "对已保存发票正净额行的原发票贷项凭证（多行部分抵扣、按累计净额比例摊算税额、"
+        "完全抵扣恰好抵完原行税额、不改写原发票与收款流水）、"
         "供应商发票号码批次查重（NFKC 规范化后同供应商内判重）、"
         "SQLite 持久化。"
     ),
@@ -500,3 +505,67 @@ def read_installment_plan(
     return database.installment_plan_status(
         conn, row, int(plan["id"]), plan["created_at"], item_rows, cutoff
     )
+
+
+# ---- 原发票贷项凭证 ----
+
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/credit-memos",
+    response_model=CreditMemoResult,
+    status_code=201,
+    tags=["credit-memos"],
+)
+def create_credit_memo(
+    invoice_id: int,
+    payload: CreditMemoCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """对已保存发票的正净额行提交一张可含多行的部分抵扣贷项凭证。
+
+    每行给出 ``line_no`` 与本次抵扣净额 ``net``；同一凭证内行号不得重复，
+    净额必须是发票币种最小单位的正整数倍，引用的原行必须存在且原净额为正，
+    同一原行历次抵扣净额合计不得超过原净额。每行本次抵扣税额按
+
+    ``round(原行已确认税额 × 抵扣后累计净额 / 原净额) − 历次已记税额``
+
+    计算（HALF_UP 到币种最小单位）；**完全抵扣时累计税额恰好等于原行已确认
+    税额**，即原行税额被恰好抵完。发票存在性、行号/金额/累计超额校验与凭证头、
+    凭证行写入在**同一个 ``BEGIN IMMEDIATE`` 事务**内完成，任一校验失败整体
+    回滚、不留任何凭证行。发票不存在返回 404，其余校验错误返回 422。
+
+    贷项凭证只追加到独立的表：**原发票（逐行净额/税额/含税额、汇总）与收款流水
+    （收款、冲销、未收余额、逾期、分期计划视图）全部保持原样**。
+    """
+
+    items = [
+        (item.line_no, to_decimal(item.net, f"lines[{idx}].net"))
+        for idx, item in enumerate(payload.lines, start=1)
+    ]
+    try:
+        return database.create_credit_memo(conn, invoice_id, items)
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/credit-memos",
+    response_model=CreditMemoOverview,
+    tags=["credit-memos"],
+)
+def list_credit_memos(
+    invoice_id: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """按原发票查询全部贷项凭证（按凭证创建顺序），并给出逐原行累计抵扣。
+
+    每张凭证返回各行本次净额、税额、含税额以及抵扣后该原行的累计抵扣净额/税额；
+    顶层 ``line_credits`` 按原行号汇总当前累计抵扣净额/税额/含税额与剩余净额。
+    纯读接口：原发票与收款流水保持原样，无凭证时 ``credit_count`` 为 0、
+    ``memos`` 与 ``line_credits`` 为空列表。发票不存在返回 404。
+    """
+
+    row = database.get_invoice(conn, invoice_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    return database.credit_memo_overview(conn, row)

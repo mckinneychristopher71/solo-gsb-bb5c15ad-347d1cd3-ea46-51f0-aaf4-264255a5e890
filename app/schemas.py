@@ -568,3 +568,109 @@ class InvoiceNumberCheckResult(BaseModel):
     """查重响应：只包含重复组，按组内最早输入位置升序；无重复时为空列表。"""
 
     items: list[InvoiceNumberDuplicateGroup]
+
+
+# ---- 原发票贷项凭证 ----
+
+
+class CreditMemoLineIn(BaseModel):
+    """创建贷项凭证时对单个原行的本次抵扣。"""
+
+    line_no: int = Field(
+        description="被抵扣的原发票行号（创建发票时按输入顺序从 1 开始）"
+    )
+    net: str = Field(
+        description="本次抵扣净额，发票币种的十进制字符串；必须大于 0、为币种最小单位"
+        "的正整数倍，且与该原行历次抵扣净额合计不得超过原行净额，如 '3.34'"
+    )
+
+    @field_validator("line_no")
+    @classmethod
+    def _check_line_no(cls, v: int) -> int:
+        if isinstance(v, bool) or v <= 0:
+            raise ValueError(f"line_no 必须是正整数，收到 {v!r}")
+        return v
+
+    @field_validator("net")
+    @classmethod
+    def _check_net(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"net 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class CreditMemoCreate(BaseModel):
+    """为已保存发票创建一张部分抵扣贷项凭证的请求体（可含多行）。"""
+
+    lines: list[CreditMemoLineIn] = Field(
+        min_length=1,
+        description="本次抵扣明细，至少 1 行；同一凭证内 line_no 不得重复",
+    )
+
+    @field_validator("lines")
+    @classmethod
+    def _check_unique_line_no(cls, v: list[CreditMemoLineIn]) -> list[CreditMemoLineIn]:
+        seen: set[int] = set()
+        for idx, item in enumerate(v, start=1):
+            if item.line_no in seen:
+                raise ValueError(
+                    f"贷项凭证明细第 {idx} 行的 line_no={item.line_no} 与前面的行重复，"
+                    f"同一凭证内行号不得重复"
+                )
+            seen.add(item.line_no)
+        return v
+
+
+class CreditMemoLineOut(BaseModel):
+    """凭证单个抵扣行：本次净额/税额/含税额 + 抵扣后该原行的累计抵扣。"""
+
+    model_config = ConfigDict(extra="allow")
+    line_no: int
+    net: str
+    tax: str
+    gross: str
+    cumulative_net: str
+    cumulative_tax: str
+
+
+class CreditMemoResult(BaseModel):
+    """贷项凭证创建结果：凭证头合计 + 逐行本次与累计抵扣。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    currency: str
+    created_at: str
+    net_total: str
+    tax_total: str
+    gross_total: str
+    lines: list[CreditMemoLineOut]
+
+
+class CreditMemoLineCumulative(BaseModel):
+    """按原发票查询时，单个原行截至当前的累计抵扣与剩余净额。"""
+
+    model_config = ConfigDict(extra="allow")
+    line_no: int
+    credited_net: str
+    credited_tax: str
+    credited_gross: str
+    remaining_net: str
+
+
+class CreditMemoOverview(BaseModel):
+    """按原发票查询的全部贷项凭证与逐原行累计抵扣（创建接口只返回单张结果）。"""
+
+    model_config = ConfigDict(extra="allow")
+    invoice_id: int
+    currency: str
+    total_net: str
+    total_tax: str
+    total_gross: str
+    credit_count: int
+    credited_net: str
+    credited_tax: str
+    credited_gross: str
+    line_credits: list[CreditMemoLineCumulative]
+    memos: list[CreditMemoResult]

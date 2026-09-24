@@ -1,6 +1,6 @@
 """SQLite 持久化层。
 
-存储六张表：
+存储八张表：
 * ``invoices``          —— 发票头（含原始请求 JSON，用于复算）与汇总金额；
 * ``invoice_lines``     —— 逐行结果（税额残差分配后的最终值，含换算列）；
 * ``payments``          —— 收款登记（每笔收款的金额、币种与登记时间）；
@@ -8,7 +8,11 @@
   关联原收款流水；原收款不删除，余额一律按净入账额 = 收款 − 冲销 计算）；
 * ``installment_plans``      —— 分期回款计划头（每张发票至多一份，invoice_id 唯一）；
 * ``installment_plan_items`` —— 计划期次（期次号、到期日、金额，按期次号升序），
-  期次金额合计等于发票含税总额；查询时不改写计划，覆盖/逾期状态实时按净已收额计算。
+  期次金额合计等于发票含税总额；查询时不改写计划，覆盖/逾期状态实时按净已收额计算；
+* ``credit_memos``       —— 原发票贷项凭证头（每张凭证关联一张已保存发票，
+  只追加、永不改写原发票与收款流水）与本次抵扣净额/税额/含税额合计；
+* ``credit_memo_lines``  —— 凭证逐行（原行号、本次抵扣净额/税额/含税额，
+  以及抵扣后该原行的累计抵扣净额/税额），``UNIQUE(memo_id, line_no)`` 兜底行号不重复。
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any
 
 SCHEMA = """
@@ -99,6 +103,35 @@ CREATE TABLE IF NOT EXISTS installment_plan_items (
 
 CREATE INDEX IF NOT EXISTS idx_installment_plan_items_plan_id
     ON installment_plan_items(plan_id);
+
+-- 原发票贷项凭证：只追加凭证，不改动 invoices / invoice_lines / payments
+CREATE TABLE IF NOT EXISTS credit_memos (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    currency   TEXT NOT NULL,
+    net_total  TEXT NOT NULL,
+    tax_total  TEXT NOT NULL,
+    gross_total TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_memos_invoice_id
+    ON credit_memos(invoice_id);
+
+CREATE TABLE IF NOT EXISTS credit_memo_lines (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    memo_id       INTEGER NOT NULL REFERENCES credit_memos(id) ON DELETE CASCADE,
+    line_no       INTEGER NOT NULL,
+    net           TEXT NOT NULL,
+    tax           TEXT NOT NULL,
+    gross         TEXT NOT NULL,
+    cumulative_net TEXT NOT NULL,
+    cumulative_tax TEXT NOT NULL,
+    UNIQUE(memo_id, line_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_memo_lines_memo_id
+    ON credit_memo_lines(memo_id);
 """
 
 
@@ -1024,4 +1057,309 @@ def installment_plan_status(
         "uncovered_total": format(uncovered_total.quantize(unit), "f"),
         "overdue_total": format(overdue_total.quantize(unit), "f"),
         "installments": items,
+    }
+
+
+# ---- 原发票贷项凭证 ----
+
+
+def _credited_totals(
+    conn: sqlite3.Connection, invoice_id: int
+) -> dict[int, tuple[Decimal, Decimal]]:
+    """该发票各原行**截至当前**的历次抵扣（净额, 税额）合计，用 Decimal 逐行求和。
+
+    不使用 SQLite 浮点 SUM 聚合：凭证头与凭证行各自存放字符串金额，在 Python 侧
+    按原行号累加。从未被抵扣过的行不出现在返回字典中（由调用方按 0 处理）。
+    """
+
+    rows = conn.execute(
+        """
+        SELECT l.line_no AS line_no, l.net AS net, l.tax AS tax
+        FROM credit_memo_lines l
+        JOIN credit_memos m ON m.id = l.memo_id
+        WHERE m.invoice_id = ?
+        """,
+        (invoice_id,),
+    ).fetchall()
+    totals: dict[int, tuple[Decimal, Decimal]] = {}
+    for r in rows:
+        line_no = int(r["line_no"])
+        prev_net, prev_tax = totals.get(line_no, (Decimal("0"), Decimal("0")))
+        totals[line_no] = (prev_net + Decimal(r["net"]), prev_tax + Decimal(r["tax"]))
+    return totals
+
+
+def create_credit_memo(
+    conn: sqlite3.Connection,
+    invoice_id: int,
+    items: list[tuple[int, Decimal]],
+) -> dict[str, Any]:
+    """为已保存发票创建一张可含多行的部分抵扣贷项凭证：校验与写入在**同一事务**。
+
+    ``items`` 为 ``(line_no, net)`` 列表（调用方/schema 层已保证非空且行号不重复，
+    事务内再防御性校验一次）。``BEGIN IMMEDIATE`` 事务内完成全部业务校验，任一不
+    满足都回滚、**不留下任何凭证行**：
+
+    * 发票不存在 -> :class:`InvoiceNotFoundError`
+    * 行号重复、引用的原行不存在、原行净额不为正（净额 ≤ 0 的行不能用本接口抵扣）、
+      本次抵扣净额 ≤ 0、不是发票币种最小单位的正整数倍、累计抵扣将超过原行净额
+      -> ``ValueError``
+
+    每行本次抵扣税额口径（全程 Decimal 高精度，最后按币种最小单位 HALF_UP）：
+
+        累计应记税额 = round(原行已确认税额 × 抵扣后累计净额 / 原行净额)
+        本次抵扣税额 = 累计应记税额 − 历次已记税额
+
+    因此当 ``抵扣后累计净额 == 原行净额``（完全抵扣）时，累计应记税额必然恰好等于
+    原行已确认税额，**原行税额被恰好抵完**；多次部分抵扣的税额之和也恒等于该累计
+    口径下的应记值。
+
+    原发票（``invoices`` / ``invoice_lines``）与收款流水（``payments`` /
+    ``payment_reversals``）在整个过程中保持原样，凭证只追加到独立的两张表。
+    """
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        inv = conn.execute(
+            "SELECT id, currency, currency_digits FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+        if inv is None:
+            raise InvoiceNotFoundError(invoice_id)
+
+        # 防御性再校验：明细非空且行号不得重复（schema 层通常已拦截）
+        if not items:
+            raise ValueError("贷项凭证明细不能为空")
+        line_nos = [line_no for line_no, _raw in items]
+        if len(line_nos) != len(set(line_nos)):
+            dupes = sorted(
+                {line_no for line_no in line_nos if line_nos.count(line_no) > 1}
+            )
+            raise ValueError(f"贷项凭证明细包含重复行号：{dupes}")
+
+        unit = _minor_unit(int(inv["currency_digits"]))
+        original_rows = {
+            int(r["line_no"]): r
+            for r in conn.execute(
+                "SELECT line_no, net, tax FROM invoice_lines WHERE invoice_id = ?",
+                (invoice_id,),
+            ).fetchall()
+        }
+        prev_totals = _credited_totals(conn, invoice_id)
+
+        # 保持请求顺序（而非按行号排序）：逐行展示的行序与提交一致
+        result_lines: list[dict[str, Any]] = []
+        memo_net = Decimal("0")
+        memo_tax = Decimal("0")
+        memo_gross = Decimal("0")
+        with localcontext() as ctx:
+            ctx.prec = 50
+            for line_no, raw_net in items:
+                original = original_rows.get(line_no)
+                if original is None:
+                    raise ValueError(
+                        f"原发票 {invoice_id} 不存在行号 {line_no}，无法抵扣"
+                    )
+                original_net = Decimal(original["net"])
+                original_tax = Decimal(original["tax"])
+                if original_net <= 0:
+                    raise ValueError(
+                        f"原发票行 {line_no} 的净额 {format(original_net, 'f')} 不为正，"
+                        f"贷项凭证只能抵扣正净额行"
+                    )
+                if raw_net <= 0:
+                    raise ValueError(
+                        f"行 {line_no} 的本次抵扣净额必须大于 0，收到 {raw_net}"
+                    )
+                if (raw_net / unit) != (raw_net / unit).to_integral_value():
+                    raise ValueError(
+                        f"行 {line_no} 的本次抵扣净额 {raw_net} 不是 "
+                        f"{inv['currency']} 最小单位 {format(unit, 'f')} 的整数倍"
+                    )
+                net = raw_net.quantize(unit)
+
+                prev_net, prev_tax = prev_totals.get(line_no, (Decimal("0"), Decimal("0")))
+                cumulative_net = prev_net + net
+                if cumulative_net > original_net:
+                    raise ValueError(
+                        f"行 {line_no} 本次抵扣 {format(net, 'f')} 后累计抵扣将达 "
+                        f"{format(cumulative_net, 'f')}，超过原行净额 "
+                        f"{format(original_net, 'f')}（历次已抵扣 {format(prev_net, 'f')}），"
+                        f"未写入任何凭证"
+                    )
+
+                cumulative_tax = (
+                    original_tax * cumulative_net / original_net
+                ).quantize(unit, rounding=ROUND_HALF_UP)
+                if cumulative_net == original_net:
+                    # 不变量保证：完全抵扣时恰好抵完原行已确认税额
+                    cumulative_tax = original_tax
+                tax = cumulative_tax - prev_tax
+                gross = net + tax
+
+                result_lines.append(
+                    {
+                        "line_no": line_no,
+                        "net": format(net, "f"),
+                        "tax": format(tax, "f"),
+                        "gross": format(gross, "f"),
+                        "cumulative_net": format(cumulative_net, "f"),
+                        "cumulative_tax": format(cumulative_tax, "f"),
+                    }
+                )
+                memo_net += net
+                memo_tax += tax
+                memo_gross += gross
+
+        created_at = utc_now_iso()
+        cur = conn.execute(
+            """
+            INSERT INTO credit_memos (
+                invoice_id, currency, net_total, tax_total, gross_total, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                invoice_id,
+                inv["currency"],
+                format(memo_net, "f"),
+                format(memo_tax, "f"),
+                format(memo_gross, "f"),
+                created_at,
+            ),
+        )
+        memo_id = int(cur.lastrowid)
+        conn.executemany(
+            """
+            INSERT INTO credit_memo_lines (
+                memo_id, line_no, net, tax, gross, cumulative_net, cumulative_tax
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    memo_id,
+                    line["line_no"],
+                    line["net"],
+                    line["tax"],
+                    line["gross"],
+                    line["cumulative_net"],
+                    line["cumulative_tax"],
+                )
+                for line in result_lines
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    return {
+        "id": memo_id,
+        "invoice_id": invoice_id,
+        "currency": inv["currency"],
+        "created_at": created_at,
+        "net_total": format(memo_net, "f"),
+        "tax_total": format(memo_tax, "f"),
+        "gross_total": format(memo_gross, "f"),
+        "lines": result_lines,
+    }
+
+
+def get_credit_memos(
+    conn: sqlite3.Connection, invoice_id: int
+) -> list[dict[str, Any]]:
+    """按原发票查询全部贷项凭证（按凭证 id 升序，凭证行按行号升序）。"""
+
+    memo_rows = list(
+        conn.execute(
+            """
+            SELECT * FROM credit_memos
+            WHERE invoice_id = ? ORDER BY id
+            """,
+            (invoice_id,),
+        ).fetchall()
+    )
+    memos: list[dict[str, Any]] = []
+    for m in memo_rows:
+        line_rows = conn.execute(
+            "SELECT * FROM credit_memo_lines WHERE memo_id = ? ORDER BY line_no",
+            (m["id"],),
+        ).fetchall()
+        memos.append(
+            {
+                "id": int(m["id"]),
+                "invoice_id": int(m["invoice_id"]),
+                "currency": m["currency"],
+                "created_at": m["created_at"],
+                "net_total": m["net_total"],
+                "tax_total": m["tax_total"],
+                "gross_total": m["gross_total"],
+                "lines": [
+                    {
+                        "line_no": int(r["line_no"]),
+                        "net": r["net"],
+                        "tax": r["tax"],
+                        "gross": r["gross"],
+                        "cumulative_net": r["cumulative_net"],
+                        "cumulative_tax": r["cumulative_tax"],
+                    }
+                    for r in line_rows
+                ],
+            }
+        )
+    return memos
+
+
+def credit_memo_overview(
+    conn: sqlite3.Connection, invoice: sqlite3.Row
+) -> dict[str, Any]:
+    """某张发票的全部贷项凭证视图（供 GET 使用），含逐原行累计抵扣汇总。
+
+    逐原行累计净额/税额直接在 Python 侧用 Decimal 汇总全部凭证行（不走 SQLite
+    浮点聚合）；``remaining_net`` 为原行净额减去累计抵扣净额。只列出被凭证引用
+    过的原行，按 ``line_no`` 升序。
+    """
+
+    memos = get_credit_memos(conn, int(invoice["id"]))
+    unit = _minor_unit(int(invoice["currency_digits"]))
+    credited = _credited_totals(conn, int(invoice["id"]))
+
+    credited_net = sum((net for net, _tax in credited.values()), Decimal("0"))
+    credited_tax = sum((tax for _net, tax in credited.values()), Decimal("0"))
+
+    original_nets = {
+        int(r["line_no"]): Decimal(r["net"])
+        for r in conn.execute(
+            "SELECT line_no, net FROM invoice_lines WHERE invoice_id = ?",
+            (invoice["id"],),
+        ).fetchall()
+    }
+    line_credits: list[dict[str, Any]] = []
+    for line_no in sorted(credited):
+        net_total, tax_total = credited[line_no]
+        net_total = net_total.quantize(unit)
+        tax_total = tax_total.quantize(unit)
+        line_credits.append(
+            {
+                "line_no": line_no,
+                "credited_net": format(net_total, "f"),
+                "credited_tax": format(tax_total, "f"),
+                "credited_gross": format(net_total + tax_total, "f"),
+                "remaining_net": format(
+                    original_nets.get(line_no, Decimal("0")) - net_total, "f"
+                ),
+            }
+        )
+
+    return {
+        "invoice_id": int(invoice["id"]),
+        "currency": invoice["currency"],
+        "total_net": invoice["total_net"],
+        "total_tax": invoice["total_tax"],
+        "total_gross": invoice["total_gross"],
+        "credit_count": len(memos),
+        "credited_net": format(credited_net.quantize(unit), "f"),
+        "credited_tax": format(credited_tax.quantize(unit), "f"),
+        "credited_gross": format((credited_net + credited_tax).quantize(unit), "f"),
+        "line_credits": line_credits,
+        "memos": memos,
     }
