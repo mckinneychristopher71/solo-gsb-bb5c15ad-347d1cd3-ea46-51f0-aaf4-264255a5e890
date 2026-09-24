@@ -568,3 +568,84 @@ class InvoiceNumberCheckResult(BaseModel):
     """查重响应：只包含重复组，按组内最早输入位置升序；无重复时为空列表。"""
 
     items: list[InvoiceNumberDuplicateGroup]
+
+
+# ---- 原发票贷项凭证 ----
+
+
+class CreditNoteLineIn(BaseModel):
+    """对原发票某一行的本次部分抵扣。"""
+
+    line_no: int = Field(
+        ge=1,
+        description="原发票行号（创建发票时按输入顺序从 1 开始编号）",
+    )
+    net: str = Field(
+        description="本次抵扣净额，发票币种的十进制字符串；必须大于 0 且为币种最小单位的整数倍，"
+        "如 USD 下 '10.00'、JPY 下 '100'"
+    )
+
+    @field_validator("net")
+    @classmethod
+    def _check_amount(cls, v: str) -> str:
+        v = v.strip()
+        if not _DECIMAL_RE.match(v):
+            raise ValueError(f"net 必须是十进制数字字符串，收到 {v!r}")
+        return v
+
+
+class CreditNoteCreate(BaseModel):
+    """对一张已保存发票创建贷项凭证的请求体：一张凭证可含多个原行的部分抵扣。"""
+
+    lines: list[CreditNoteLineIn] = Field(
+        min_length=1,
+        description="抵扣行列表，至少 1 行；同一张凭证内 line_no 不得重复，"
+        "同一原行的历次累计抵扣净额不得超过该原行净额",
+    )
+
+    @field_validator("lines")
+    @classmethod
+    def _check_no_duplicate_line_no(cls, v: list[CreditNoteLineIn]) -> list[CreditNoteLineIn]:
+        seen: set[int] = set()
+        for item in v:
+            if item.line_no in seen:
+                raise ValueError(f"抵扣行 line_no 重复：{item.line_no}")
+            seen.add(item.line_no)
+        return v
+
+
+class CreditNoteLineOut(BaseModel):
+    """贷项凭证中的一行：本次抵扣额 + 抵扣后该原行的累计抵扣情况。"""
+
+    model_config = ConfigDict(extra="allow")
+    line_no: int
+    net: str
+    tax: str
+    gross: str
+    original_net: str
+    original_tax: str
+    cumulative_net: str
+    cumulative_tax: str
+
+
+class CreditNoteResult(BaseModel):
+    """贷项凭证创建/查询结果：各行净额、税额、含税额及抵扣后累计抵扣。"""
+
+    model_config = ConfigDict(extra="allow")
+    id: int
+    invoice_id: int
+    currency: str
+    created_at: str
+    total_net: str
+    total_tax: str
+    total_gross: str
+    lines: list[CreditNoteLineOut]
+
+
+class CreditNoteList(BaseModel):
+    """按原发票查询的全部贷项凭证（按凭证 id 升序，即创建先后顺序）。"""
+
+    invoice_id: int
+    currency: str
+    count: int
+    credit_notes: list[CreditNoteResult]

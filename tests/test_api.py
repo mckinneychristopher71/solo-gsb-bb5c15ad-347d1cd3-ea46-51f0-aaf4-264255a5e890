@@ -1715,6 +1715,423 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 422, body)
 
+    def test_31_credit_note_basic_proration(self) -> None:
+        # 行 1：net 10.00 × 0.13 = tax 1.30；行 2：net 33.33 × 0.10 = 3.333 → 3.33
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"description": "a", "net": "10.00", "tax_rate": "0.13"},
+                    {"description": "b", "net": "33.33", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/credit-notes"
+
+        # 行 1 抵扣一半：累计税额 = round_half_up(1.30 × 5.00 / 10.00) = 0.65
+        status, note = self._request(
+            "POST", path, {"lines": [{"line_no": 1, "net": "5.00"}]}
+        )
+        self.assertEqual(status, 201, note)
+        self.assertEqual(note["invoice_id"], invoice_id)
+        self.assertEqual(note["currency"], "USD")
+        self.assertIn("created_at", note)
+        self.assertEqual(note["total_net"], "5.00")
+        self.assertEqual(note["total_tax"], "0.65")
+        self.assertEqual(note["total_gross"], "5.65")
+        self.assertEqual(
+            note["lines"],
+            [
+                {
+                    "line_no": 1,
+                    "net": "5.00",
+                    "tax": "0.65",
+                    "gross": "5.65",
+                    "original_net": "10.00",
+                    "original_tax": "1.30",
+                    "cumulative_net": "5.00",
+                    "cumulative_tax": "0.65",
+                }
+            ],
+        )
+
+        # 行 2 抵扣 16.67：累计税额 = round_half_up(3.33 × 16.67 / 33.33) = 1.67
+        status, note = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": "16.67"}]}
+        )
+        self.assertEqual(status, 201, note)
+        line2 = note["lines"][0]
+        self.assertEqual(line2["net"], "16.67")
+        self.assertEqual(line2["tax"], "1.67")
+        self.assertEqual(line2["gross"], "18.34")
+        self.assertEqual(line2["original_net"], "33.33")
+        self.assertEqual(line2["original_tax"], "3.33")
+        self.assertEqual(line2["cumulative_net"], "16.67")
+        self.assertEqual(line2["cumulative_tax"], "1.67")
+
+        # 再抵 16.66 恰好抵完行 2：本次税额 = 3.33 − 1.67 = 1.66
+        status, note = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": "16.66"}]}
+        )
+        self.assertEqual(status, 201, note)
+        line2 = note["lines"][0]
+        self.assertEqual(line2["net"], "16.66")
+        self.assertEqual(line2["tax"], "1.66")
+        self.assertEqual(line2["gross"], "18.32")
+        self.assertEqual(line2["cumulative_net"], "33.33")
+        self.assertEqual(line2["cumulative_tax"], "3.33")  # 恰好抵完原行税额
+
+        # 已抵完，再抵 0.01 -> 422
+        status, body = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": "0.01"}]}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("超过原净额", body["detail"])
+
+    def test_32_credit_note_multi_line_and_list(self) -> None:
+        # 行 1 net 100.00 rate 0.13 -> tax 13.00；行 2 net 50.00 rate 0.06 -> 3.00
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "100.00", "tax_rate": "0.13"},
+                    {"net": "50.00", "tax_rate": "0.06"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/credit-notes"
+
+        # 一张凭证含多行
+        status, note = self._request(
+            "POST",
+            path,
+            {"lines": [{"line_no": 2, "net": "25.00"}, {"line_no": 1, "net": "50.00"}]},
+        )
+        self.assertEqual(status, 201, note)
+        # 明细按 line_no 升序返回
+        self.assertEqual(
+            [(l["line_no"], l["net"], l["tax"], l["gross"],
+              l["cumulative_net"], l["cumulative_tax"])
+             for l in note["lines"]],
+            [
+                (1, "50.00", "6.50", "56.50", "50.00", "6.50"),
+                (2, "25.00", "1.50", "26.50", "25.00", "1.50"),
+            ],
+        )
+        self.assertEqual(note["total_net"], "75.00")
+        self.assertEqual(note["total_tax"], "8.00")
+        self.assertEqual(note["total_gross"], "83.00")
+
+        # 第二张凭证：两张各自独立累计
+        status, note2 = self._request(
+            "POST", path, {"lines": [{"line_no": 1, "net": "25.00"}]}
+        )
+        self.assertEqual(status, 201, note2)
+        l1 = note2["lines"][0]
+        # 累计税额 = round(13.00 × 75 / 100) = 9.75；本次 = 9.75 − 6.50 = 3.25
+        self.assertEqual(l1["cumulative_net"], "75.00")
+        self.assertEqual(l1["cumulative_tax"], "9.75")
+        self.assertEqual(l1["tax"], "3.25")
+
+        # 按原发票查询：按凭证 id 升序
+        status, listing = self._request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["invoice_id"], invoice_id)
+        self.assertEqual(listing["currency"], "USD")
+        self.assertEqual(listing["count"], 2)
+        self.assertEqual([n["id"] for n in listing["credit_notes"]],
+                         [note["id"], note2["id"]])
+        self.assertEqual(listing["credit_notes"][0], note)
+        self.assertEqual(listing["credit_notes"][1], note2)
+
+        # 没有凭证的发票查询得到空列表
+        status, plain = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "10.00", "tax_rate": "0"}]},
+        )
+        self.assertEqual(status, 201)
+        status, empty = self._request(
+            "GET", f"/api/v1/invoices/{plain['id']}/credit-notes"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(empty, {"invoice_id": plain["id"], "currency": "USD",
+                                 "count": 0, "credit_notes": []})
+
+    def test_33_credit_note_full_deduction_and_jpy(self) -> None:
+        # JPY：net 6 × 10% = 0.6 → 已确认税额 1；分三次各抵 2：
+        # 累计税额 round(1 × 2/6)=round(0.333)=0、
+        # round(1 × 4/6)=round(0.667)=1、round(1 × 6/6)=1；
+        # 本次税额依次为 0、1、0，合计恰好抵完原行税额
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "JPY", "lines": [{"net": "6", "tax_rate": "0.10"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        self.assertEqual(inv["lines"][0]["tax"], "1")
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/credit-notes"
+
+        seen: list[tuple[str, str, str, str]] = []
+        for amount in ("2", "2", "2"):
+            status, note = self._request(
+                "POST", path, {"lines": [{"line_no": 1, "net": amount}]}
+            )
+            self.assertEqual(status, 201, note)
+            l = note["lines"][0]
+            seen.append((l["net"], l["tax"], l["cumulative_net"], l["cumulative_tax"]))
+        self.assertEqual(
+            seen,
+            [("2", "0", "2", "0"), ("2", "1", "4", "1"), ("2", "0", "6", "1")],
+        )
+        # 金额不带小数位（0 位小数币种）；末张凭证本次税额为 0
+        # （1 单位税额已在第二张凭证记完），但累计税额仍为 1
+        status, listing = self._request("GET", path)
+        self.assertEqual(status, 200)
+        last = listing["credit_notes"][-1]
+        self.assertEqual(last["total_net"], "2")
+        self.assertEqual(last["total_tax"], "0")
+        self.assertEqual(last["total_gross"], "2")
+        # 历次已记税额合计恰好等于原行已确认税额
+        total_tax = sum(int(n["lines"][0]["tax"]) for n in listing["credit_notes"])
+        self.assertEqual(total_tax, 1)
+
+        # 已抵完再抵 -> 422
+        status, body = self._request(
+            "POST", path, {"lines": [{"line_no": 1, "net": "1"}]}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("超过原净额", body["detail"])
+
+        # JPY 最小单位为 1：0.5 必须拒绝
+        status, _ = self._request(
+            "POST", path, {"lines": [{"line_no": 1, "net": "0.5"}]}
+        )
+        self.assertEqual(status, 422)
+
+    def test_34_credit_note_validation_and_rollback(self) -> None:
+        # 第一张发票：行 1 负净额（冲红行）、行 2 正净额
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "-10.00", "tax_rate": "0.10"},
+                    {"net": "20.00", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/credit-notes"
+
+        # 非正净额原行不能抵扣
+        status, body = self._request(
+            "POST", path, {"lines": [{"line_no": 1, "net": "1.00"}]}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("非正数", body["detail"])
+
+        # 不存在的行号
+        status, body = self._request(
+            "POST", path, {"lines": [{"line_no": 9, "net": "1.00"}]}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("不存在", body["detail"])
+
+        # 同凭证内重复行号（pydantic 422，detail 为错误列表）
+        status, body = self._request(
+            "POST",
+            path,
+            {"lines": [{"line_no": 2, "net": "1.00"}, {"line_no": 2, "net": "2.00"}]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("重复", json.dumps(body, ensure_ascii=False))
+
+        # 金额：0 / 负数 / 非最小单位 / 非十进制 / 非字符串
+        for bad in ("0", "-1.00", "0.005", "abc"):
+            status, _ = self._request(
+                "POST", path, {"lines": [{"line_no": 2, "net": bad}]}
+            )
+            self.assertEqual(status, 422, bad)
+        status, _ = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": 1.5}]}
+        )
+        self.assertEqual(status, 422)
+        status, _ = self._request(
+            "POST", path, {"lines": [{"line_no": 0, "net": "1.00"}]}
+        )
+        self.assertEqual(status, 422)
+        status, _ = self._request("POST", path, {"lines": []})
+        self.assertEqual(status, 422)
+
+        # 以上失败均不得留下凭证
+        status, listing = self._request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["count"], 0)
+
+        # 第二张发票：两个正净额行，用于多行凭证整笔回滚验证
+        status, inv2 = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {
+                "currency": "USD",
+                "lines": [
+                    {"net": "20.00", "tax_rate": "0.10"},
+                    {"net": "20.00", "tax_rate": "0.10"},
+                ],
+            },
+        )
+        self.assertEqual(status, 201, inv2)
+        path2 = f"/api/v1/invoices/{inv2['id']}/credit-notes"
+        # 首行合法（抵 19.00），第二行超额（25.00 > 原净额 20.00）：整笔拒绝
+        status, body = self._request(
+            "POST",
+            path2,
+            {"lines": [
+                {"line_no": 1, "net": "19.00"},
+                {"line_no": 2, "net": "25.00"},
+            ]},
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("超过原净额", body["detail"])
+        status, listing = self._request("GET", path2)
+        self.assertEqual(listing["count"], 0)
+
+        # 第一张发票的历次累计校验（先抵 19.00，再抵 2.00 超额）
+        status, _ = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": "19.00"}]}
+        )
+        self.assertEqual(status, 201)
+        status, body = self._request(
+            "POST", path, {"lines": [{"line_no": 2, "net": "2.00"}]}
+        )
+        self.assertEqual(status, 422)
+        self.assertIn("超过原净额", body["detail"])
+        status, listing = self._request("GET", path)
+        self.assertEqual(listing["count"], 1)
+        self.assertEqual(listing["credit_notes"][0]["lines"][0]["net"], "19.00")
+
+        # 发票不存在：创建 404、查询 404
+        status, body = self._request(
+            "POST",
+            "/api/v1/invoices/999999/credit-notes",
+            {"lines": [{"line_no": 1, "net": "1.00"}]},
+        )
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", body["detail"])
+        status, body = self._request("GET", "/api/v1/invoices/999999/credit-notes")
+        self.assertEqual(status, 404)
+
+    def test_35_credit_note_concurrent_no_overcredit(self) -> None:
+        # net 100.00、tax 13.00：10 个并发凭证各抵 20.00，
+        # BEGIN IMMEDIATE 串行化 -> 恰好 5 笔成功、5 笔 422，累计不超额
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0.13"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        path = f"/api/v1/invoices/{invoice_id}/credit-notes"
+
+        codes: list[int] = []
+        lock = threading.Lock()
+
+        def create() -> None:
+            code, _ = self._request(
+                "POST", path, {"lines": [{"line_no": 1, "net": "20.00"}]}
+            )
+            with lock:
+                codes.append(code)
+
+        threads = [threading.Thread(target=create) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(codes), [201] * 5 + [422] * 5)
+        status, listing = self._request("GET", path)
+        self.assertEqual(status, 200)
+        self.assertEqual(listing["count"], 5)
+        from decimal import Decimal
+        total_net = sum(
+            (Decimal(n["lines"][0]["net"]) for n in listing["credit_notes"]),
+            Decimal("0"),
+        )
+        total_tax = sum(
+            (Decimal(n["lines"][0]["tax"]) for n in listing["credit_notes"]),
+            Decimal("0"),
+        )
+        self.assertEqual(total_net, Decimal("100.00"))
+        # 完全抵扣时历次已记税额合计恰好等于原行税额
+        self.assertEqual(total_tax, Decimal("13.00"))
+        last = listing["credit_notes"][-1]["lines"][0]
+        self.assertEqual(last["cumulative_net"], "100.00")
+        self.assertEqual(last["cumulative_tax"], "13.00")
+
+    def test_36_credit_note_keeps_invoice_and_payments_intact(self) -> None:
+        # 原发票与收款流水在创建贷项凭证后必须保持原样
+        status, inv = self._request(
+            "POST",
+            "/api/v1/invoices",
+            {"currency": "USD", "lines": [{"net": "100.00", "tax_rate": "0.13"}]},
+        )
+        self.assertEqual(status, 201, inv)
+        invoice_id = inv["id"]
+        self.assertEqual(inv["totals"]["total_gross"], "113.00")
+
+        status, pay = self._request(
+            "POST", f"/api/v1/invoices/{invoice_id}/payments", {"amount": "40.00"}
+        )
+        self.assertEqual(status, 201, pay)
+
+        status, note = self._request(
+            "POST",
+            f"/api/v1/invoices/{invoice_id}/credit-notes",
+            {"lines": [{"line_no": 1, "net": "30.00"}]},
+        )
+        self.assertEqual(status, 201, note)
+        self.assertEqual(note["lines"][0]["tax"], "3.90")
+
+        # 原发票：逐行金额、汇总、复算标志均不变
+        status, refetched = self._request("GET", f"/api/v1/invoices/{invoice_id}")
+        self.assertEqual(status, 200)
+        self.assertTrue(refetched["recompute_matched"])
+        self.assertEqual(refetched["totals"], inv["totals"])
+        self.assertEqual(
+            [(l["line_no"], l["net"], l["tax"], l["gross"]) for l in refetched["lines"]],
+            [(1, "100.00", "13.00", "113.00")],
+        )
+
+        # 收款流水与未收余额不受贷项凭证影响
+        status, ov = self._request("GET", f"/api/v1/invoices/{invoice_id}/payments")
+        self.assertEqual(status, 200)
+        self.assertEqual(ov["payment_count"], 1)
+        self.assertEqual(ov["paid_total"], "40.00")
+        self.assertEqual(ov["outstanding"], "73.00")
+        self.assertEqual(ov["payments"][0]["amount"], "40.00")
+
+        # 贷项凭证也不出现在发票分页汇总中（汇总金额仍是原发票金额）
+        status, page = self._request("GET", "/api/v1/invoices?page_size=100")
+        self.assertEqual(status, 200)
+        item = next(it for it in page["items"] if it["id"] == invoice_id)
+        self.assertEqual(item["total_net"], "100.00")
+        self.assertEqual(item["total_tax"], "13.00")
+        self.assertEqual(item["total_gross"], "113.00")
+        self.assertEqual(item["line_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

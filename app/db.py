@@ -9,6 +9,10 @@
 * ``installment_plans``      —— 分期回款计划头（每张发票至多一份，invoice_id 唯一）；
 * ``installment_plan_items`` —— 计划期次（期次号、到期日、金额，按期次号升序），
   期次金额合计等于发票含税总额；查询时不改写计划，覆盖/逾期状态实时按净已收额计算。
+* ``credit_notes``       —— 原发票贷项凭证头（一张凭证对一张已保存发票，可含多行）；
+* ``credit_note_lines``  —— 凭证明细（原行行号、本次抵扣净额/税额/含税额，
+  以及抵扣后该原行的累计净额/税额）；写入只新增凭证记录，**从不改写原发票、
+  原发票行与收款流水**。
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any
 
 SCHEMA = """
@@ -99,6 +103,28 @@ CREATE TABLE IF NOT EXISTS installment_plan_items (
 
 CREATE INDEX IF NOT EXISTS idx_installment_plan_items_plan_id
     ON installment_plan_items(plan_id);
+
+CREATE TABLE IF NOT EXISTS credit_notes (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_notes_invoice_id ON credit_notes(invoice_id);
+
+CREATE TABLE IF NOT EXISTS credit_note_lines (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    credit_note_id INTEGER NOT NULL REFERENCES credit_notes(id) ON DELETE CASCADE,
+    line_no        INTEGER NOT NULL,
+    net            TEXT NOT NULL,
+    tax            TEXT NOT NULL,
+    gross          TEXT NOT NULL,
+    cumulative_net TEXT NOT NULL,
+    cumulative_tax TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_note_lines_credit_note_id
+    ON credit_note_lines(credit_note_id);
 """
 
 
@@ -1024,4 +1050,279 @@ def installment_plan_status(
         "uncovered_total": format(uncovered_total.quantize(unit), "f"),
         "overdue_total": format(overdue_total.quantize(unit), "f"),
         "installments": items,
+    }
+
+
+# ---- 原发票贷项凭证 ----
+
+
+def _credit_note_view(conn: sqlite3.Connection, note_row: sqlite3.Row) -> dict[str, Any]:
+    """用凭证头与明细行组装响应视图；原行净额/税额取自 invoice_lines（从不改写）。"""
+
+    invoice_id = int(note_row["invoice_id"])
+    unit = _minor_unit(int(note_row["currency_digits"]))
+    rows = list(
+        conn.execute(
+            """
+            SELECT cl.line_no, cl.net, cl.tax, cl.gross,
+                   cl.cumulative_net, cl.cumulative_tax,
+                   il.net AS original_net, il.tax AS original_tax
+            FROM credit_note_lines cl
+            JOIN invoice_lines il
+              ON il.invoice_id = ? AND il.line_no = cl.line_no
+            WHERE cl.credit_note_id = ?
+            ORDER BY cl.line_no
+            """,
+            (invoice_id, int(note_row["id"])),
+        ).fetchall()
+    )
+    lines: list[dict[str, Any]] = []
+    total_net = Decimal("0")
+    total_tax = Decimal("0")
+    total_gross = Decimal("0")
+    for r in rows:
+        net = Decimal(r["net"])
+        tax = Decimal(r["tax"])
+        gross = Decimal(r["gross"])
+        total_net += net
+        total_tax += tax
+        total_gross += gross
+        lines.append(
+            {
+                "line_no": int(r["line_no"]),
+                "net": format(net.quantize(unit), "f"),
+                "tax": format(tax.quantize(unit), "f"),
+                "gross": format(gross.quantize(unit), "f"),
+                "original_net": r["original_net"],
+                "original_tax": r["original_tax"],
+                "cumulative_net": r["cumulative_net"],
+                "cumulative_tax": r["cumulative_tax"],
+            }
+        )
+    return {
+        "id": int(note_row["id"]),
+        "invoice_id": invoice_id,
+        "currency": note_row["currency"],
+        "created_at": note_row["created_at"],
+        "total_net": format(total_net.quantize(unit), "f"),
+        "total_tax": format(total_tax.quantize(unit), "f"),
+        "total_gross": format(total_gross.quantize(unit), "f"),
+        "lines": lines,
+    }
+
+
+def create_credit_note(
+    conn: sqlite3.Connection,
+    invoice_id: int,
+    lines: list[tuple[int, Decimal]],
+) -> dict[str, Any]:
+    """为一张已保存发票创建一张可含多行的部分抵扣贷项凭证。
+
+    ``lines`` 为 ``(原行行号 line_no, 本次抵扣净额)`` 列表，调用方（schema 层）
+    已保证非空且凭证内 line_no 不重复。全部校验与凭证头/明细写入在**同一个
+    ``BEGIN IMMEDIATE`` 写事务**内完成：「读原行与历次抵扣 -> 逐行校验并算税 ->
+    写入」之间不会被另一张凭证插队，同一原行的历次累计抵扣净额绝不会超过原净额。
+
+    仅允许抵扣**正净额原行**：
+
+    * 发票不存在 -> :class:`InvoiceNotFoundError`
+    * line_no 不存在（或该行净额 ≤ 0）-> ``ValueError``
+    * 本次抵扣净额 ≤ 0、不是币种最小单位整数倍 -> ``ValueError``
+    * 加上本次后该原行累计抵扣净额超过原净额 -> ``ValueError``
+
+    每行本次税额按
+
+        抵扣后累计税额 = round_half_up(原行已确认税额 × 抵扣后累计净额 / 原净额)
+        本次税额       = 抵扣后累计税额 − 历次已记税额
+
+    计算（以币种最小单位四舍五入）；原净额恰好抵完时累计税额恒等于原行已确认
+    税额，即完全抵扣时恰好抵完原行税额。任一行校验失败整体回滚，不留任何凭证行；
+    原发票、原发票行与收款流水始终保持原样。
+    """
+
+    # 防御性校验，避免绕过 API 直接调用本函数时部分写入
+    if not lines:
+        raise ValueError("抵扣行不能为空")
+    line_nos = [line_no for line_no, _amount in lines]
+    if len(line_nos) != len(set(line_nos)):
+        raise ValueError("同一张贷项凭证内 line_no 不得重复")
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        inv = conn.execute(
+            "SELECT id, currency, currency_digits FROM invoices WHERE id = ?",
+            (invoice_id,),
+        ).fetchone()
+        if inv is None:
+            raise InvoiceNotFoundError(invoice_id)
+
+        currency = inv["currency"]
+        unit = _minor_unit(int(inv["currency_digits"]))
+        original_rows = list(
+            conn.execute(
+                "SELECT line_no, net, tax FROM invoice_lines WHERE invoice_id = ?",
+                (invoice_id,),
+            ).fetchall()
+        )
+        original_by_no = {int(r["line_no"]): r for r in original_rows}
+
+        # 每个被抵扣原行的历次已记净额/税额，用 Decimal 逐行求和（不走浮点 SUM）
+        target_nos = list(dict.fromkeys(line_nos))
+        placeholders = ",".join("?" for _ in target_nos)
+        prior_rows = conn.execute(
+            f"""
+            SELECT il.line_no, cl.net, cl.tax
+            FROM credit_note_lines cl
+            JOIN credit_notes cn ON cn.id = cl.credit_note_id
+            JOIN invoice_lines il
+              ON il.invoice_id = cn.invoice_id AND il.line_no = cl.line_no
+            WHERE cn.invoice_id = ? AND il.line_no IN ({placeholders})
+            """,
+            (invoice_id, *target_nos),
+        ).fetchall()
+        prior_net: dict[int, Decimal] = {}
+        prior_tax: dict[int, Decimal] = {}
+        for r in prior_rows:
+            no = int(r["line_no"])
+            prior_net[no] = prior_net.get(no, Decimal("0")) + Decimal(r["net"])
+            prior_tax[no] = prior_tax.get(no, Decimal("0")) + Decimal(r["tax"])
+
+        prepared: list[dict[str, Any]] = []
+        with localcontext() as ctx:
+            ctx.prec = 50
+            for idx, (line_no, raw_amount) in enumerate(lines, start=1):
+                original = original_by_no.get(line_no)
+                if original is None:
+                    raise ValueError(
+                        f"第 {idx} 行 line_no={line_no} 在发票 {invoice_id} 中不存在"
+                    )
+                original_net = Decimal(original["net"])
+                original_tax = Decimal(original["tax"])
+                if original_net <= 0:
+                    # 只有正净额原行允许抵扣（冲红/零额行不在贷项凭证范围内）
+                    raise ValueError(
+                        f"第 {idx} 行 line_no={line_no} 的原净额 "
+                        f"{format(original_net, 'f')} 非正数，不能抵扣"
+                    )
+                if raw_amount <= 0:
+                    raise ValueError(
+                        f"第 {idx} 行（line_no={line_no}）抵扣净额必须大于 0，"
+                        f"收到 {format(raw_amount, 'f')}"
+                    )
+                if (raw_amount / unit) != (raw_amount / unit).to_integral_value():
+                    raise ValueError(
+                        f"第 {idx} 行（line_no={line_no}）抵扣净额 {format(raw_amount, 'f')} "
+                        f"不是 {currency} 最小单位 {format(unit, 'f')} 的整数倍"
+                    )
+                amount = raw_amount.quantize(unit)
+
+                before_net = prior_net.get(line_no, Decimal("0")).quantize(unit)
+                before_tax = prior_tax.get(line_no, Decimal("0")).quantize(unit)
+                cumulative_net = before_net + amount
+                if cumulative_net > original_net:
+                    raise ValueError(
+                        f"第 {idx} 行（line_no={line_no}）抵扣后累计净额 "
+                        f"{format(cumulative_net, 'f')} 超过原净额 "
+                        f"{format(original_net, 'f')}（历次已抵扣 {format(before_net, 'f')}），"
+                        f"未创建任何凭证"
+                    )
+
+                cumulative_tax = (
+                    original_tax * cumulative_net / original_net
+                ).quantize(unit, rounding=ROUND_HALF_UP)
+                if cumulative_net == original_net:
+                    # 完全抵扣：必须恰好抵完原行已确认税额（比例公式此时本就等于原税额）
+                    cumulative_tax = original_tax
+                tax = cumulative_tax - before_tax
+                if tax < 0:
+                    # 数学上不可能（HALF_UP 对非负输入单调不减）；作为不变量防御
+                    raise AssertionError(
+                        f"第 {idx} 行（line_no={line_no}）本次税额为负：{format(tax, 'f')}"
+                    )
+                gross = amount + tax
+                prepared.append(
+                    {
+                        "line_no": line_no,
+                        "net": amount,
+                        "tax": tax,
+                        "gross": gross,
+                        "cumulative_net": cumulative_net,
+                        "cumulative_tax": cumulative_tax,
+                    }
+                )
+
+        created_at = utc_now_iso()
+        cur = conn.execute(
+            "INSERT INTO credit_notes (invoice_id, created_at) VALUES (?, ?)",
+            (invoice_id, created_at),
+        )
+        credit_note_id = int(cur.lastrowid)
+        conn.executemany(
+            """
+            INSERT INTO credit_note_lines (
+                credit_note_id, line_no, net, tax, gross,
+                cumulative_net, cumulative_tax
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    credit_note_id,
+                    item["line_no"],
+                    format(item["net"], "f"),
+                    format(item["tax"], "f"),
+                    format(item["gross"], "f"),
+                    format(item["cumulative_net"], "f"),
+                    format(item["cumulative_tax"], "f"),
+                )
+                for item in prepared
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+    note_row = conn.execute(
+        """
+        SELECT cn.id, cn.invoice_id, cn.created_at,
+               i.currency, i.currency_digits
+        FROM credit_notes cn JOIN invoices i ON i.id = cn.invoice_id
+        WHERE cn.id = ?
+        """,
+        (credit_note_id,),
+    ).fetchone()
+    return _credit_note_view(conn, note_row)
+
+
+def list_credit_notes(conn: sqlite3.Connection, invoice_id: int) -> dict[str, Any] | None:
+    """按原发票查询全部贷项凭证（按凭证 id 升序）。发票不存在返回 ``None``。
+
+    纯读接口：原发票与收款流水保持原样，凭证金额全部取自已持久化的凭证行。
+    """
+
+    inv = conn.execute(
+        "SELECT id, currency FROM invoices WHERE id = ?",
+        (invoice_id,),
+    ).fetchone()
+    if inv is None:
+        return None
+
+    note_rows = list(
+        conn.execute(
+            """
+            SELECT cn.id, cn.invoice_id, cn.created_at,
+                   i.currency, i.currency_digits
+            FROM credit_notes cn JOIN invoices i ON i.id = cn.invoice_id
+            WHERE cn.invoice_id = ?
+            ORDER BY cn.id
+            """,
+            (invoice_id,),
+        ).fetchall()
+    )
+    notes = [_credit_note_view(conn, r) for r in note_rows]
+    return {
+        "invoice_id": invoice_id,
+        "currency": inv["currency"],
+        "count": len(notes),
+        "credit_notes": notes,
     }

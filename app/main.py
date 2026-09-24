@@ -20,6 +20,9 @@ from .calc import compute_invoice, recompute_matches, to_decimal
 from .currency import UnknownCurrencyError
 from .duplicates import find_duplicates
 from .schemas import (
+    CreditNoteCreate,
+    CreditNoteList,
+    CreditNoteResult,
     Health,
     InstallmentPlanCreate,
     InstallmentPlanResult,
@@ -52,7 +55,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="发票税额计算 API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "基于 Decimal 的发票税额计算服务：按币种最小单位舍入、"
         "最大余数法分配残差、可复算，支持跨币种换算、收款登记与未收余额查询、"
@@ -62,6 +65,8 @@ app = FastAPI(
         "单张发票指定 UTC 时点的历史收款快照（截止秒闭区间）、"
         "单张发票唯一一份分期回款计划（按期次顺序 FIFO 抵扣、逾期额按查询日计算）、"
         "供应商发票号码批次查重（NFKC 规范化后同供应商内判重）、"
+        "对已保存发票正净额行的原发票贷项凭证（一张凭证可含多行部分抵扣、"
+        "累计抵扣不超过原行、税额按累计抵扣净额比例计算）、"
         "SQLite 持久化。"
     ),
     lifespan=lifespan,
@@ -500,3 +505,62 @@ def read_installment_plan(
     return database.installment_plan_status(
         conn, row, int(plan["id"]), plan["created_at"], item_rows, cutoff
     )
+
+
+# ---- 原发票贷项凭证 ----
+
+
+@app.post(
+    "/api/v1/invoices/{invoice_id}/credit-notes",
+    response_model=CreditNoteResult,
+    status_code=201,
+    tags=["credit-notes"],
+)
+def create_credit_note(
+    invoice_id: int,
+    payload: CreditNoteCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """对已保存发票的正净额行创建一张可含多行的部分抵扣贷项凭证。
+
+    每行给出原行 ``line_no`` 与本次抵扣净额；同一凭证内重复行号、净额不是
+    币种最小单位整数倍、引用不存在或非正净额的原行返回 422。同一原行历次
+    抵扣净额之和不得超过原净额，累计校验与凭证写入在**同一个
+    ``BEGIN IMMEDIATE`` 写事务**内完成，并发凭证不会超额。
+
+    每行本次税额按「原行已确认税额 × 抵扣后累计净额 / 原净额」以币种最小单位
+    四舍五入得到抵扣后累计税额，再减去历次已记税额得出；完全抵扣（累计净额
+    恰好等于原净额）时累计税额恰好等于原行税额。原发票、原发票行与收款流水
+    始终保持原样，凭证只新增独立记录。
+    """
+
+    lines = [
+        (item.line_no, to_decimal(item.net, f"抵扣行 line_no={item.line_no} 的 net"))
+        for item in payload.lines
+    ]
+    try:
+        return database.create_credit_note(conn, invoice_id, lines)
+    except database.InvoiceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get(
+    "/api/v1/invoices/{invoice_id}/credit-notes",
+    response_model=CreditNoteList,
+    tags=["credit-notes"],
+)
+def list_credit_notes(
+    invoice_id: int,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict[str, Any]:
+    """按原发票查询全部贷项凭证（按凭证创建先后排列）。
+
+    每张凭证返回各行本次净额、税额、含税额以及抵扣后该原行的累计抵扣净额与
+    税额（并回显原行净额/税额）；纯读接口，不改动原发票与收款流水。
+    发票不存在返回 404；发票尚无凭证时返回空列表。
+    """
+
+    result = database.list_credit_notes(conn, invoice_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"发票 {invoice_id} 不存在")
+    return result
